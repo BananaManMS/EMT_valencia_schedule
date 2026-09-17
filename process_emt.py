@@ -27,15 +27,15 @@ def time_to_minutes(time_str: str) -> int:
     return -1
 
 def clean_text(val: str) -> str:
-    """Normaliza texto Unicode (elimina \xa0 y dobles espacios)."""
+    """Normaliza texto Unicode (elimina \xa0 y espacios redundantes)."""
     if pd.isna(val):
         return ""
     normalized = unicodedata.normalize("NFKC", str(val))
     return " ".join(normalized.split())
 
 def sanitize_filename(name: str) -> str:
-    """Evita caracteres inválidos en el sistema de archivos."""
-    return "".join(c for c in name if c.isalnum() or c in ("-", "_")).strip()
+    """Garantiza nombres seguros para los archivos en disco."""
+    return "".join(c for c in str(name) if c.isalnum() or c in ("-", "_")).strip()
 
 def main():
     print("Descargando GTFS de EMT Valencia...")
@@ -45,7 +45,7 @@ def main():
     raw_zip = resp.content
     current_hash = get_hash(raw_zip)
 
-    # 1. Comprobación rápida de cambios
+    # 1. Control de cambios por hash SHA256
     if os.path.exists(HASH_FILE):
         with open(HASH_FILE, "r", encoding="utf-8") as f:
             last_hash = f.read().strip()
@@ -62,23 +62,44 @@ def main():
 
     zf = zipfile.ZipFile(io.BytesIO(raw_zip))
 
-    # 2. Lectura y tipado estricto
+    # 2. Carga con las cabeceras exactas del feed
+    # Routes.txt: route_id,agency_id,route_short_name,route_long_name,...
     routes = pd.read_csv(zf.open("routes.txt"), dtype={"route_id": str, "route_short_name": str})
-    trips = pd.read_csv(zf.open("trips.txt"), dtype={"trip_id": str, "route_id": str, "service_id": str, "shape_id": str})
+    
+    # trips.txt: route_id,service_id,trip_id,trip_headsign,trip_short_name,shape_id
+    trips = pd.read_csv(zf.open("trips.txt"), dtype={
+        "route_id": str, 
+        "service_id": str, 
+        "trip_id": str, 
+        "trip_headsign": str, 
+        "shape_id": str
+    })
+    
+    # stops.txt: stop_id,stop_code,stop_name,stop_desc,stop_lat,stop_lon,...
     stops = pd.read_csv(zf.open("stops.txt"), dtype={"stop_id": str})
+    
+    # stop_times.txt: trip_id,arrival_time,departure_time,stop_id,stop_sequence,...
     stop_times = pd.read_csv(zf.open("stop_times.txt"), dtype={"trip_id": str, "stop_id": str})
     
+    # Calendar y Calendar_dates
     calendar = pd.read_csv(zf.open("calendar.txt"), dtype={"service_id": str}) if "calendar.txt" in zf.namelist() else pd.DataFrame()
     calendar_dates = pd.read_csv(zf.open("calendar_dates.txt"), dtype={"service_id": str, "date": str}) if "calendar_dates.txt" in zf.namelist() else pd.DataFrame()
 
+    # Mapeo route_id -> route_short_name (Línea: "4", "C1", etc.)
     route_map = dict(zip(routes["route_id"], routes["route_short_name"]))
     trips["line"] = trips["route_id"].map(route_map)
 
-    # 3. Generación de stops.json
+    # 3. stops.json
     print("Procesando paradas y líneas vinculadas...")
     trip_stops = stop_times[["trip_id", "stop_id"]].drop_duplicates()
     trip_lines = trip_stops.merge(trips[["trip_id", "line"]], on="trip_id")
-    lines_per_stop = trip_lines.groupby("stop_id")["line"].unique().apply(lambda x: sorted(list(set(str(l) for l in x if pd.notna(l))))).to_dict()
+    lines_per_stop = (
+        trip_lines.dropna(subset=["line"])
+        .groupby("stop_id")["line"]
+        .unique()
+        .apply(lambda x: sorted(list(set(str(l) for l in x))))
+        .to_dict()
+    )
 
     stops_list = []
     for _, row in stops.iterrows():
@@ -94,7 +115,8 @@ def main():
     with open(f"{OUTPUT_DIR}/stops.json", "w", encoding="utf-8") as f:
         json.dump(stops_list, f, ensure_ascii=False, separators=(",", ":"))
 
-    # 4. Generación de shapes/{line}.json
+    # 4. shapes/{line}.json
+    # shapes.txt: shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence,shape_dist_traveled
     if "shapes.txt" in zf.namelist():
         print("Codificando trazados en polilíneas...")
         shapes_df = pd.read_csv(zf.open("shapes.txt"), dtype={"shape_id": str})
@@ -105,8 +127,8 @@ def main():
             coords = list(zip(group["shape_pt_lat"], group["shape_pt_lon"]))
             encoded_shapes[shape_id] = polyline.encode(coords)
 
-        # Mapear shape con sentido y cabecera
-        trip_shapes = trips.dropna(subset=["shape_id", "line"])[["line", "shape_id", "trip_headsign", "direction_id"]].drop_duplicates(subset=["shape_id"])
+        # Mapeo directo por shape_id -> headsign (sin direction_id)
+        trip_shapes = trips.dropna(subset=["shape_id", "line"])[["line", "shape_id", "trip_headsign"]].drop_duplicates(subset=["shape_id"])
         
         for line, group in trip_shapes.groupby("line"):
             line_shapes = {}
@@ -115,15 +137,14 @@ def main():
                 if shp_id in encoded_shapes:
                     line_shapes[shp_id] = {
                         "headsign": clean_text(r["trip_headsign"]),
-                        "direction": int(r["direction_id"]) if pd.notna(r.get("direction_id")) else 0,
                         "poly": encoded_shapes[shp_id]
                     }
             
-            safe_name = sanitize_filename(str(line))
+            safe_name = sanitize_filename(line)
             with open(f"{OUTPUT_DIR}/shapes/{safe_name}.json", "w", encoding="utf-8") as f:
                 json.dump(line_shapes, f, ensure_ascii=False, separators=(",", ":"))
 
-    # 5. Calendarios: resolución de días de semana (1=Lunes .. 7=Domingo) y excepciones
+    # 5. Calendarios: Días de semana (1=Lunes .. 7=Domingo) y excepciones
     print("Mapeando vigencia y días de servicio...")
     service_info = {}
     day_cols = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
@@ -145,11 +166,10 @@ def main():
             if sid not in service_info:
                 service_info[sid] = {"days": [], "dates": []}
                 
-            # type 1: Servicio añadido/especial para ese día
             if ex_type == 1:
                 service_info[sid]["dates"].append(d_str)
 
-    # 6. Salidas programadas por parada (departures/{stop_id}.json)
+    # 6. Salidas por parada: departures/{stop_id}.json
     print("Generando salidas programadas por parada...")
     stop_times["m"] = stop_times["departure_time"].apply(time_to_minutes)
     valid_times = stop_times[stop_times["m"] >= 0]
@@ -181,7 +201,7 @@ def main():
         with open(f"{OUTPUT_DIR}/departures/{stop_id}.json", "w", encoding="utf-8") as f:
             json.dump({"id": str(stop_id), "schedules": schedules}, f, ensure_ascii=False, separators=(",", ":"))
 
-    # 7. Actualizar hash local
+    # 7. Guardar hash de la versión procesada
     with open(HASH_FILE, "w", encoding="utf-8") as f:
         f.write(current_hash)
 
