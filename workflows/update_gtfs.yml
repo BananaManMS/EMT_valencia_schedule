@@ -1,0 +1,53 @@
+name: Update EMT GTFS Static
+
+on:
+  schedule:
+    - cron: '37 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas requests polyline
+
+      - name: Fetch previous hash from data branch
+        run: |
+          # Descarga el hash previo para comparar sin necesidad de clonar la rama entera
+          curl -s -f "https://raw.githubusercontent.com/${{ github.repository }}/data/gtfs_sha256.txt" -o gtfs_sha256.txt || true
+
+      - name: Run GTFS Extraction & Optimization
+        run: |
+          python process_emt.py
+
+      - name: Deploy clean data branch
+        run: |
+          if [ -d "data" ]; then
+            echo "Desplegando nuevos datos en la rama 'data'..."
+            cp gtfs_sha256.txt data/
+            cd data
+            git init
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout -b data
+            git add .
+            git commit -m "Auto-update EMT GTFS: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
+          else
+            echo "El feed de la EMT no ha cambiado. Rama 'data' intacta."
+          fi
