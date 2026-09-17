@@ -33,10 +33,6 @@ def clean_text(val: str) -> str:
     normalized = unicodedata.normalize("NFKC", str(val))
     return " ".join(normalized.split())
 
-def sanitize_filename(name: str) -> str:
-    """Garantiza nombres seguros para los archivos en disco."""
-    return "".join(c for c in str(name) if c.isalnum() or c in ("-", "_")).strip()
-
 def main():
     print("Descargando GTFS de EMT Valencia...")
     headers = {"User-Agent": "Mozilla/5.0 (EMT GTFS Sync Agent)"}
@@ -57,16 +53,12 @@ def main():
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     
-    os.makedirs(f"{OUTPUT_DIR}/shapes", exist_ok=True)
     os.makedirs(f"{OUTPUT_DIR}/departures", exist_ok=True)
 
     zf = zipfile.ZipFile(io.BytesIO(raw_zip))
 
     # 2. Carga con las cabeceras exactas del feed
-    # Routes.txt: route_id,agency_id,route_short_name,route_long_name,...
     routes = pd.read_csv(zf.open("routes.txt"), dtype={"route_id": str, "route_short_name": str})
-    
-    # trips.txt: route_id,service_id,trip_id,trip_headsign,trip_short_name,shape_id
     trips = pd.read_csv(zf.open("trips.txt"), dtype={
         "route_id": str, 
         "service_id": str, 
@@ -74,14 +66,9 @@ def main():
         "trip_headsign": str, 
         "shape_id": str
     })
-    
-    # stops.txt: stop_id,stop_code,stop_name,stop_desc,stop_lat,stop_lon,...
     stops = pd.read_csv(zf.open("stops.txt"), dtype={"stop_id": str})
-    
-    # stop_times.txt: trip_id,arrival_time,departure_time,stop_id,stop_sequence,...
     stop_times = pd.read_csv(zf.open("stop_times.txt"), dtype={"trip_id": str, "stop_id": str})
     
-    # Calendar y Calendar_dates
     calendar = pd.read_csv(zf.open("calendar.txt"), dtype={"service_id": str}) if "calendar.txt" in zf.namelist() else pd.DataFrame()
     calendar_dates = pd.read_csv(zf.open("calendar_dates.txt"), dtype={"service_id": str, "date": str}) if "calendar_dates.txt" in zf.namelist() else pd.DataFrame()
 
@@ -115,10 +102,9 @@ def main():
     with open(f"{OUTPUT_DIR}/stops.json", "w", encoding="utf-8") as f:
         json.dump(stops_list, f, ensure_ascii=False, separators=(",", ":"))
 
-    # 4. shapes/{line}.json
-    # shapes.txt: shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence,shape_dist_traveled
+    # 4. shapes.json consolidado
     if "shapes.txt" in zf.namelist():
-        print("Codificando trazados en polilíneas...")
+        print("Codificando trazados en shapes.json...")
         shapes_df = pd.read_csv(zf.open("shapes.txt"), dtype={"shape_id": str})
         shapes_df.sort_values(by=["shape_id", "shape_pt_sequence"], inplace=True)
 
@@ -127,22 +113,23 @@ def main():
             coords = list(zip(group["shape_pt_lat"], group["shape_pt_lon"]))
             encoded_shapes[shape_id] = polyline.encode(coords)
 
-        # Mapeo directo por shape_id -> headsign (sin direction_id)
+        # Mapeo directo por línea -> shape_id -> datos
         trip_shapes = trips.dropna(subset=["shape_id", "line"])[["line", "shape_id", "trip_headsign"]].drop_duplicates(subset=["shape_id"])
         
+        all_shapes = {}
         for line, group in trip_shapes.groupby("line"):
-            line_shapes = {}
+            line_str = str(line)
+            all_shapes[line_str] = {}
             for _, r in group.iterrows():
                 shp_id = r["shape_id"]
                 if shp_id in encoded_shapes:
-                    line_shapes[shp_id] = {
+                    all_shapes[line_str][shp_id] = {
                         "headsign": clean_text(r["trip_headsign"]),
                         "poly": encoded_shapes[shp_id]
                     }
-            
-            safe_name = sanitize_filename(line)
-            with open(f"{OUTPUT_DIR}/shapes/{safe_name}.json", "w", encoding="utf-8") as f:
-                json.dump(line_shapes, f, ensure_ascii=False, separators=(",", ":"))
+        
+        with open(f"{OUTPUT_DIR}/shapes.json", "w", encoding="utf-8") as f:
+            json.dump(all_shapes, f, ensure_ascii=False, separators=(",", ":"))
 
     # 5. Calendarios: Días de semana (1=Lunes .. 7=Domingo) y excepciones
     print("Mapeando vigencia y días de servicio...")
