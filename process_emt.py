@@ -75,10 +75,33 @@ def main():
     # Mapeo route_id -> route_short_name (Línea: "4", "C1", etc.)
     route_map = dict(zip(routes["route_id"], routes["route_short_name"]))
     trips["line"] = trips["route_id"].map(route_map)
+    trips["trip_headsign"] = trips["trip_headsign"].fillna("").apply(clean_text)
 
-    # 3. stops.json
+    # -------------------------------------------------------------
+    # FILTRO CLAVE: Aislar únicamente las SALIDAS comerciales
+    # -------------------------------------------------------------
+    print("Filtrando salidas reales (excluyendo llegadas/términos de trayecto)...")
+    
+    # Criterio A: Descartar la última parada de cada viaje (llegada a fin de línea)
+    if "stop_sequence" in stop_times.columns:
+        stop_times["stop_sequence"] = pd.to_numeric(stop_times["stop_sequence"], errors="coerce")
+        max_seq_per_trip = stop_times.groupby("trip_id")["stop_sequence"].transform("max")
+        is_departure = stop_times["stop_sequence"] < max_seq_per_trip
+    else:
+        # Fallback defensivo si no existiera la columna
+        is_departure = stop_times.groupby("trip_id").cumcount(ascending=False) > 0
+
+    # Criterio B: Descartar paradas técnicas o de solo descenso (pickup_type == 1)
+    if "pickup_type" in stop_times.columns:
+        is_pickup_allowed = ~stop_times["pickup_type"].astype(str).str.strip().isin(["1", "1.0"])
+        is_departure = is_departure & is_pickup_allowed
+
+    # DataFrame con únicamente paradas con subida de viajeros permitida
+    departures_stop_times = stop_times[is_departure].copy()
+
+    # 3. stops.json (líneas que realmente parten de cada parada)
     print("Procesando paradas y líneas vinculadas...")
-    trip_stops = stop_times[["trip_id", "stop_id"]].drop_duplicates()
+    trip_stops = departures_stop_times[["trip_id", "stop_id"]].drop_duplicates()
     trip_lines = trip_stops.merge(trips[["trip_id", "line"]], on="trip_id")
     lines_per_stop = (
         trip_lines.dropna(subset=["line"])
@@ -113,7 +136,6 @@ def main():
             coords = list(zip(group["shape_pt_lat"], group["shape_pt_lon"]))
             encoded_shapes[shape_id] = polyline.encode(coords)
 
-        # Mapeo directo por línea -> shape_id -> datos
         trip_shapes = trips.dropna(subset=["shape_id", "line"])[["line", "shape_id", "trip_headsign"]].drop_duplicates(subset=["shape_id"])
         
         all_shapes = {}
@@ -124,7 +146,7 @@ def main():
                 shp_id = r["shape_id"]
                 if shp_id in encoded_shapes:
                     all_shapes[line_str][shp_id] = {
-                        "headsign": clean_text(r["trip_headsign"]),
+                        "headsign": r["trip_headsign"],
                         "poly": encoded_shapes[shp_id]
                     }
         
@@ -156,10 +178,10 @@ def main():
             if ex_type == 1:
                 service_info[sid]["dates"].append(d_str)
 
-    # 6. Salidas por parada: departures/{stop_id}.json
+    # 6. Salidas por parada: departures/{stop_id}.json (solo salidas filtradas)
     print("Generando salidas programadas por parada...")
-    stop_times["m"] = stop_times["departure_time"].apply(time_to_minutes)
-    valid_times = stop_times[stop_times["m"] >= 0]
+    departures_stop_times["m"] = departures_stop_times["departure_time"].apply(time_to_minutes)
+    valid_times = departures_stop_times[departures_stop_times["m"] >= 0]
 
     merged_trips = valid_times.merge(
         trips[["trip_id", "service_id", "trip_headsign", "line"]], 
@@ -176,7 +198,7 @@ def main():
             
             entry = {
                 "line": str(line),
-                "dest": clean_text(headsign),
+                "dest": headsign,
                 "days": srv["days"],
                 "times": mins
             }
