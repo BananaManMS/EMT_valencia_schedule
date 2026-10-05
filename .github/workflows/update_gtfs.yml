@@ -2,7 +2,8 @@ name: Update EMT GTFS Static
 
 on:
   schedule:
-    - cron: '37 2 * * *'
+    - cron: '17 0 * * *'   # principal, minuto raro
+    - cron: '37 2 * * *'   # respaldo
   workflow_dispatch:
 
 permissions:
